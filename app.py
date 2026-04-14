@@ -5,7 +5,7 @@ import gemmi
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="CIF Σ Calculator", layout="wide")
+st.set_page_config(page_title="Σ Value, Coord. bond length Calculator", layout="wide")
 
 METAL_ELEMENTS = {
     "Fe", "Co", "Mn", "Ni", "Cu", "Zn", "Cr", "V", "Ru", "Rh", "Pd", "Pt"
