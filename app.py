@@ -12,7 +12,7 @@ METAL_ELEMENTS = {
 }
 DONOR_ELEMENTS = {"N", "O", "S", "Cl", "Br", "F"}
 DEFAULT_MAX_CENTERS = 2
-DEFAULT_RADIUS = 3.2
+DEFAULT_RADIUS = 2.5
 DEFAULT_EXPECTED_CN = 6
 
 
@@ -24,15 +24,6 @@ def angle_deg(v1: Tuple[float, float, float], v2: Tuple[float, float, float]) ->
         return float("nan")
     c = max(-1.0, min(1.0, dot / (n1 * n2)))
     return math.degrees(math.acos(c))
-
-
-def frac_distance(cell: gemmi.UnitCell, f1: gemmi.Fractional, f2: gemmi.Fractional) -> float:
-    p1 = cell.orthogonalize(f1)
-    p2 = cell.orthogonalize(f2)
-    dx = p1.x - p2.x
-    dy = p1.y - p2.y
-    dz = p1.z - p2.z
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
 def find_metal_sites(small: gemmi.SmallStructure, max_centers: int) -> List[gemmi.SmallStructure.Site]:
@@ -49,8 +40,8 @@ def build_neighbor_candidates(
     radius: float
 ) -> List[Dict[str, Any]]:
     """
-    center_site の周囲にある donor 候補の「実際に近い像」を返す。
-    小さいセルで同じ mark から複数の PBC 像が半径内に入る場合にも対応。
+    center_site の周囲にある donor 候補の実像を返す。
+    PBC / 対称操作の影響で複数像が半径内に入る場合にも対応。
     """
     ns = gemmi.NeighborSearch(small, radius).populate()
     center_frac = center_site.fract
@@ -69,19 +60,14 @@ def build_neighbor_candidates(
         if site.element.name not in DONOR_ELEMENTS:
             continue
 
-        # mark.pos は対称操作後の位置。これを fractional に戻してから、
-        # 半径内の PBC 像を全部列挙する。
+        # mark.pos は対称操作後の位置
         fpos = small.cell.fractionalize(mark.pos)
 
         images = small.cell.find_nearest_pbc_images(center_frac, radius, fpos, 0)
-
         if not images:
-            # 念のため fallback
             images = [small.cell.find_nearest_pbc_image(center_cart, mark.pos, 0)]
 
         for im in images:
-            # NearestImage から fractional image を構成
-            # small-molecule 例に合わせて fract_image() を使う
             im_frac = small.cell.fract_image(im, fpos)
             im_cart = small.cell.orthogonalize(im_frac)
 
@@ -118,13 +104,11 @@ def build_neighbor_candidates(
 
 def choose_ligands(candidates: List[Dict[str, Any]], expected_cn: int) -> List[Dict[str, Any]]:
     """
-    一旦 distance の近い順に採用。
-    同一 label の重複像が連続して入るケースがあるので、まず重複を少し避ける。
+    距離の近い順を基本に、まず同一ラベル重複を避けて expected_cn 個選ぶ。
     """
     chosen = []
     used_labels = set()
 
-    # まずラベル重複なしで拾う
     for c in candidates:
         if c["label"] in used_labels:
             continue
@@ -133,7 +117,6 @@ def choose_ligands(candidates: List[Dict[str, Any]], expected_cn: int) -> List[D
         if len(chosen) == expected_cn:
             return chosen
 
-    # 足りなければ近い順で追加
     for c in candidates:
         if c in chosen:
             continue
@@ -171,11 +154,10 @@ def compute_angles_from_ligands(
                 }
             )
 
-    # 15 個のうち 90° に近い 12 個を cis として使う
+    # 15 個のうち 90° に近い 12 個を Σ に使う
     all_angles_sorted_for_sigma = sorted(all_angles, key=lambda x: x["delta90"])
     cis_used = all_angles_sorted_for_sigma[:12]
     trans_like = all_angles_sorted_for_sigma[12:]
-
     sigma = sum(x["delta90"] for x in cis_used)
 
     return {
@@ -203,10 +185,13 @@ def analyze_center(
         return None
 
     angle_info = compute_angles_from_ligands(center_cart, ligands)
+    bond_lengths = [lig["distance"] for lig in ligands]
+    mean_bond_length = sum(bond_lengths) / len(bond_lengths)
 
     return {
         "metal_label": center_site.label,
         "metal_element": center_site.element.name,
+        "mean_bond_length": round(mean_bond_length, 4),
         "ligands": [
             {
                 "label": lig["label"],
@@ -255,14 +240,34 @@ def analyze_cif(file_bytes: bytes, max_centers: int, radius: float, expected_cn:
     return results
 
 
+# ---------------- UI ----------------
+
 st.title("CIF Σ Calculator")
-st.caption("CIF をアップロードして Σ 値を計算します。90°に最も近い 12 角を Σ に使用します。")
+st.caption("CIF をアップロードすると、八面体金属中心について Σ 値と平均配位結合長を計算します。")
 
 with st.sidebar:
     st.header("設定")
-    max_centers = st.number_input("解析する金属中心数の上限", min_value=1, max_value=10, value=2, step=1)
-    radius = st.number_input("近傍探索半径 (Å)", min_value=2.0, max_value=5.0, value=3.2, step=0.1)
-    expected_cn = st.number_input("想定配位数", min_value=4, max_value=8, value=6, step=1)
+    max_centers = st.number_input(
+        "解析する金属中心数の上限",
+        min_value=1,
+        max_value=10,
+        value=DEFAULT_MAX_CENTERS,
+        step=1
+    )
+    radius = st.number_input(
+        "近傍探索半径 (Å)",
+        min_value=2.0,
+        max_value=5.0,
+        value=DEFAULT_RADIUS,
+        step=0.1
+    )
+    expected_cn = st.number_input(
+        "想定配位数",
+        min_value=4,
+        max_value=8,
+        value=DEFAULT_EXPECTED_CN,
+        step=1
+    )
     st.markdown("**対象金属**: Fe, Co, Mn, Ni, Cu, Zn, Cr, V, Ru, Rh, Pd, Pt")
     st.markdown("**対象 donor**: N, O, S, Cl, Br, F")
 
@@ -273,38 +278,56 @@ if uploaded is not None:
         results = analyze_cif(uploaded.read(), int(max_centers), float(radius), int(expected_cn))
 
         if not results:
-            st.warning("解析できる金属中心が見つかりませんでした。半径や配位数を見直してください。")
+            st.warning("解析できる金属中心が見つかりませんでした。近傍探索半径や配位数を見直してください。")
         else:
-            summary = []
+            st.subheader("計算結果")
+
+            summary_rows = []
             for i, res in enumerate(results, start=1):
-                summary.append(
+                ligand_text = ", ".join([x["label"] for x in res["ligands"]])
+                summary_rows.append(
                     {
                         "Center": i,
                         "Metal": f"{res['metal_label']} ({res['metal_element']})",
-                        "Sigma": res["sigma"],
-                        "Ligands": ", ".join([x["label"] for x in res["ligands"]]),
+                        "Σ": res["sigma"],
+                        "Mean bond length (Å)": res["mean_bond_length"],
+                        "Ligands": ligand_text,
                     }
                 )
 
-            st.subheader("結果一覧")
-            st.dataframe(pd.DataFrame(summary), use_container_width=True)
+            summary_df = pd.DataFrame(summary_rows)
+            st.dataframe(summary_df, use_container_width=True)
 
+            st.markdown("### 見やすい要約")
             for i, res in enumerate(results, start=1):
-                with st.expander(f"Center {i}: {res['metal_label']} ({res['metal_element']})", expanded=True):
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([1.3, 1, 1])
+
+                    with c1:
+                        st.markdown(f"**Center {i}: {res['metal_label']} ({res['metal_element']})**")
+                        st.write("採用配位原子:", ", ".join([x["label"] for x in res["ligands"]]))
+
+                    with c2:
+                        st.metric("Σ", f"{res['sigma']:.3f}")
+
+                    with c3:
+                        st.metric("平均配位結合長 (Å)", f"{res['mean_bond_length']:.4f}")
+
+            st.markdown("### 詳細")
+            for i, res in enumerate(results, start=1):
+                with st.expander(f"Center {i}: {res['metal_label']} ({res['metal_element']}) の詳細", expanded=False):
+                    st.markdown("#### 採用した 6 配位原子像")
+                    st.dataframe(pd.DataFrame(res["ligands"]), use_container_width=True)
+
                     col1, col2 = st.columns(2)
-
                     with col1:
-                        st.metric("Σ", res["sigma"])
-                        st.write("**採用した 6 配位原子像**")
-                        st.dataframe(pd.DataFrame(res["ligands"]), use_container_width=True)
-
-                    with col2:
-                        st.write("**Σ に使用した 12 角**")
+                        st.markdown("#### Σ に使用した 12 角")
                         st.write(", ".join(f"{x:.3f}" for x in res["cis_angles_used"]))
-                        st.write("**残り 3 角**")
+                    with col2:
+                        st.markdown("#### 残り 3 角")
                         st.write(", ".join(f"{x:.3f}" for x in res["trans_like_angles"]))
 
-                    st.write("**全 15 角**")
+                    st.markdown("#### 全 15 角")
                     st.dataframe(pd.DataFrame(res["all_angles"]), use_container_width=True)
 
             csv_rows = []
@@ -315,6 +338,7 @@ if uploaded is not None:
                         "metal_label": res["metal_label"],
                         "metal_element": res["metal_element"],
                         "sigma": res["sigma"],
+                        "mean_bond_length_A": res["mean_bond_length"],
                         "ligands": "; ".join([x["label"] for x in res["ligands"]]),
                         "distances_A": "; ".join(str(x["distance"]) for x in res["ligands"]),
                         "cis_angles_used_deg": "; ".join(map(str, res["cis_angles_used"])),
@@ -334,9 +358,10 @@ if uploaded is not None:
         st.error(f"解析に失敗しました: {e}")
 
 else:
-    st.info("CIF をアップロードしてください。")
+    st.info("CIF ファイルをアップロードしてください。")
 
 st.markdown("---")
 st.markdown(
-    "Mercury と比較するときは、まず **採用した 6 配位原子像** と **全 15 角** が一致しているかを確認してください。"
+    "このアプリでは、採用した 6 配位原子から 15 個の角を計算し、"
+    "90° に最も近い 12 個を用いて Σ を求めています。"
 )
