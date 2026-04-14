@@ -365,5 +365,4 @@ st.markdown(
     "このアプリでは、採用した 6 配位原子から 15 個の角を計算し、"
     "90° に最も近い 12 個を用いて Σ を求めています。"
 )
-    st.markdown("Copyright © 2026 Yu ODASHIMA All Rights Reserved. "
-)
+st.markdown("Copyright © 2026 Yu ODASHIMA All Rights Reserved. ")
