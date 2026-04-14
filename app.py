@@ -242,7 +242,7 @@ def analyze_cif(file_bytes: bytes, max_centers: int, radius: float, expected_cn:
 
 # ---------------- UI ----------------
 
-st.title("CIF Σ Calculator")
+st.title("Σ Value and Coord. bond length Calculator")
 st.caption("CIF をアップロードすると、八面体金属中心について Σ 値と平均配位結合長を計算します。")
 
 with st.sidebar:
