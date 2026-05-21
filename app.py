@@ -1,5 +1,6 @@
 import math
-from typing import List, Dict, Any, Tuple
+import shlex
+from typing import List, Dict, Any, Tuple, Optional
 
 import gemmi
 import pandas as pd
@@ -25,14 +26,92 @@ DEFAULT_EXPECTED_CN = 6
 
 
 # ------------------------------------------------
-# Utility
+# Basic utilities
 # ------------------------------------------------
+
+def clean_label(label: str) -> str:
+    return str(label).strip().strip("'").strip('"')
+
+
+def parse_value_esd(text: str) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    2.186(19) -> value=2.186, esd=0.019
+    89.4(6)   -> value=89.4,  esd=0.6
+    """
+    raw = str(text).strip()
+
+    if raw in {"?", ".", ""}:
+        return None, None, raw
+
+    if "(" not in raw or ")" not in raw:
+        try:
+            return float(raw), None, raw
+        except Exception:
+            return None, None, raw
+
+    try:
+        main = raw.split("(")[0]
+        esd_digits = raw.split("(")[1].split(")")[0]
+
+        value = float(main)
+
+        if "." in main:
+            decimals = len(main.split(".")[1])
+        else:
+            decimals = 0
+
+        esd = int(esd_digits) * (10 ** (-decimals))
+
+        return value, esd, raw
+
+    except Exception:
+        return None, None, raw
+
+
+def format_with_esd(
+    value: Optional[float],
+    esd: Optional[float],
+    decimals: int
+) -> str:
+    if value is None:
+        return "N/A"
+
+    if esd is None:
+        return f"{value:.{decimals}f}"
+
+    esd_int = int(round(esd * (10 ** decimals)))
+
+    return f"{value:.{decimals}f}({esd_int})"
+
+
+def calc_mean(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def propagate_mean_esd(esds: List[Optional[float]], n: int) -> Optional[float]:
+    valid = [x for x in esds if x is not None]
+
+    if len(valid) != n or n == 0:
+        return None
+
+    return math.sqrt(sum(x * x for x in valid)) / n
+
+
+def propagate_sum_esd(esds: List[Optional[float]], n: int) -> Optional[float]:
+    valid = [x for x in esds if x is not None]
+
+    if len(valid) != n:
+        return None
+
+    return math.sqrt(sum(x * x for x in valid))
+
 
 def angle_deg(
     v1: Tuple[float, float, float],
     v2: Tuple[float, float, float]
 ) -> float:
-
     dot = sum(x * y for x, y in zip(v1, v2))
 
     n1 = math.sqrt(sum(x * x for x in v1))
@@ -46,79 +125,233 @@ def angle_deg(
     return math.degrees(math.acos(c))
 
 
-def calc_sd(values: List[float]) -> float:
+# ------------------------------------------------
+# CIF loop parser
+# ------------------------------------------------
 
-    if len(values) <= 1:
-        return 0.0
-
-    mean = sum(values) / len(values)
-
-    return math.sqrt(
-        sum((x - mean) ** 2 for x in values)
-        / (len(values) - 1)
-    )
+def split_cif_line(line: str) -> List[str]:
+    try:
+        return shlex.split(line, posix=False)
+    except Exception:
+        return line.split()
 
 
-def format_with_esd(
-    value: float,
-    esd: float,
-    decimals: int
-) -> str:
+def parse_cif_loops(text: str) -> List[Dict[str, Any]]:
+    lines = text.splitlines()
+    loops = []
 
-    rounded_value = round(value, decimals)
+    i = 0
 
-    esd_int = int(
-        round(esd * (10 ** decimals))
-    )
+    while i < len(lines):
+        line = lines[i].strip()
 
-    return (
-        f"{rounded_value:.{decimals}f}"
-        f"({esd_int})"
-    )
+        if line.lower() != "loop_":
+            i += 1
+            continue
+
+        i += 1
+        headers = []
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            if not line:
+                i += 1
+                continue
+
+            if line.startswith("_"):
+                headers.append(line.split()[0])
+                i += 1
+            else:
+                break
+
+        rows = []
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            if not line:
+                i += 1
+                continue
+
+            lower = line.lower()
+
+            if (
+                lower == "loop_"
+                or lower.startswith("data_")
+                or lower.startswith("save_")
+                or line.startswith("_")
+            ):
+                break
+
+            parts = split_cif_line(line)
+
+            if len(parts) == len(headers):
+                rows.append(parts)
+            elif len(parts) > len(headers):
+                for j in range(0, len(parts), len(headers)):
+                    chunk = parts[j:j + len(headers)]
+                    if len(chunk) == len(headers):
+                        rows.append(chunk)
+
+            i += 1
+
+        loops.append(
+            {
+                "headers": headers,
+                "rows": rows
+            }
+        )
+
+    return loops
+
+
+def header_index(headers: List[str], suffix: str) -> Optional[int]:
+    suffix = suffix.lower()
+
+    for i, h in enumerate(headers):
+        if h.lower().endswith(suffix):
+            return i
+
+    return None
+
+
+def extract_geom_bonds(text: str) -> List[Dict[str, Any]]:
+    loops = parse_cif_loops(text)
+    bonds = []
+
+    for loop in loops:
+        headers = loop["headers"]
+
+        i_a1 = header_index(headers, "_geom_bond_atom_site_label_1")
+        i_a2 = header_index(headers, "_geom_bond_atom_site_label_2")
+        i_dist = header_index(headers, "_geom_bond_distance")
+
+        if i_a1 is None or i_a2 is None or i_dist is None:
+            continue
+
+        i_sym1 = header_index(headers, "_geom_bond_site_symmetry_1")
+        i_sym2 = header_index(headers, "_geom_bond_site_symmetry_2")
+        i_flag = header_index(headers, "_geom_bond_publ_flag")
+
+        for row in loop["rows"]:
+            a1 = clean_label(row[i_a1])
+            a2 = clean_label(row[i_a2])
+            value, esd, raw = parse_value_esd(row[i_dist])
+
+            bonds.append(
+                {
+                    "atom1": a1,
+                    "atom2": a2,
+                    "distance": value,
+                    "distance_esd": esd,
+                    "distance_raw": raw,
+                    "sym1": row[i_sym1] if i_sym1 is not None else "",
+                    "sym2": row[i_sym2] if i_sym2 is not None else "",
+                    "publ_flag": row[i_flag] if i_flag is not None else "",
+                }
+            )
+
+    return bonds
+
+
+def extract_geom_angles(text: str) -> List[Dict[str, Any]]:
+    loops = parse_cif_loops(text)
+    angles = []
+
+    for loop in loops:
+        headers = loop["headers"]
+
+        i_a1 = header_index(headers, "_geom_angle_atom_site_label_1")
+        i_a2 = header_index(headers, "_geom_angle_atom_site_label_2")
+        i_a3 = header_index(headers, "_geom_angle_atom_site_label_3")
+        i_ang = header_index(headers, "_geom_angle")
+
+        if i_a1 is None or i_a2 is None or i_a3 is None or i_ang is None:
+            continue
+
+        i_sym1 = header_index(headers, "_geom_angle_site_symmetry_1")
+        i_sym2 = header_index(headers, "_geom_angle_site_symmetry_2")
+        i_sym3 = header_index(headers, "_geom_angle_site_symmetry_3")
+        i_flag = header_index(headers, "_geom_angle_publ_flag")
+
+        for row in loop["rows"]:
+            a1 = clean_label(row[i_a1])
+            a2 = clean_label(row[i_a2])
+            a3 = clean_label(row[i_a3])
+            value, esd, raw = parse_value_esd(row[i_ang])
+
+            angles.append(
+                {
+                    "atom1": a1,
+                    "atom2": a2,
+                    "atom3": a3,
+                    "angle": value,
+                    "angle_esd": esd,
+                    "angle_raw": raw,
+                    "sym1": row[i_sym1] if i_sym1 is not None else "",
+                    "sym2": row[i_sym2] if i_sym2 is not None else "",
+                    "sym3": row[i_sym3] if i_sym3 is not None else "",
+                    "publ_flag": row[i_flag] if i_flag is not None else "",
+                }
+            )
+
+    return angles
 
 
 # ------------------------------------------------
-# Metal search
+# Structure utilities
 # ------------------------------------------------
+
+def get_site_dict(
+    small: gemmi.SmallStructure
+) -> Dict[str, gemmi.SmallStructure.Site]:
+    d = {}
+
+    for site in small.sites:
+        d[clean_label(site.label)] = site
+
+    return d
+
 
 def find_metal_sites(
     small: gemmi.SmallStructure,
     max_centers: int
 ) -> List[gemmi.SmallStructure.Site]:
-
     centers = []
 
     for site in small.sites:
-
         if site.element.name in METAL_ELEMENTS:
             centers.append(site)
 
     return centers[:max_centers]
 
 
+def get_cart(
+    small: gemmi.SmallStructure,
+    site: gemmi.SmallStructure.Site
+) -> gemmi.Position:
+    return small.cell.orthogonalize(site.fract)
+
+
 # ------------------------------------------------
-# Neighbor search
+# Fallback coordinate-based neighbor search
 # ------------------------------------------------
 
-def build_neighbor_candidates(
+def build_neighbor_candidates_by_coord(
     small: gemmi.SmallStructure,
     center_site: gemmi.SmallStructure.Site,
     radius: float
 ) -> List[Dict[str, Any]]:
-
     ns = gemmi.NeighborSearch(
         small,
         radius
     ).populate()
 
     center_frac = center_site.fract
-
-    center_cart = small.cell.orthogonalize(
-        center_frac
-    )
+    center_cart = small.cell.orthogonalize(center_frac)
 
     candidates = []
-
     seen = set()
 
     marks = ns.find_site_neighbors(
@@ -128,7 +361,6 @@ def build_neighbor_candidates(
     )
 
     for mark in marks:
-
         site = mark.to_site(small)
 
         if site.label == center_site.label:
@@ -147,7 +379,6 @@ def build_neighbor_candidates(
         )
 
         if not images:
-
             images = [
                 small.cell.find_nearest_pbc_image(
                     center_cart,
@@ -157,28 +388,17 @@ def build_neighbor_candidates(
             ]
 
         for im in images:
-
-            im_frac = small.cell.fract_image(
-                im,
-                fpos
-            )
-
-            im_cart = small.cell.orthogonalize(
-                im_frac
-            )
+            im_frac = small.cell.fract_image(im, fpos)
+            im_cart = small.cell.orthogonalize(im_frac)
 
             dx = im_cart.x - center_cart.x
             dy = im_cart.y - center_cart.y
             dz = im_cart.z - center_cart.z
 
-            dist = math.sqrt(
-                dx * dx +
-                dy * dy +
-                dz * dz
-            )
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
 
             key = (
-                site.label,
+                clean_label(site.label),
                 round(im_cart.x, 5),
                 round(im_cart.y, 5),
                 round(im_cart.z, 5),
@@ -191,53 +411,81 @@ def build_neighbor_candidates(
 
             candidates.append(
                 {
-                    "label": site.label,
+                    "label": clean_label(site.label),
                     "element": site.element.name,
-                    "fract": im_frac,
                     "cart": im_cart,
                     "distance": dist,
-                    "image_idx": mark.image_idx,
+                    "distance_esd": None,
+                    "distance_raw": f"{dist:.4f}",
+                    "source": "calculated from coordinates",
                 }
             )
 
-    candidates.sort(
-        key=lambda x: x["distance"]
-    )
+    candidates.sort(key=lambda x: x["distance"])
 
     return candidates
 
 
 # ------------------------------------------------
-# Ligand choice
+# Bond and angle lookup
 # ------------------------------------------------
 
-def choose_ligands(
-    candidates: List[Dict[str, Any]],
+def choose_ligands_from_geom_bond(
+    center_label: str,
+    site_dict: Dict[str, gemmi.SmallStructure.Site],
+    geom_bonds: List[Dict[str, Any]],
     expected_cn: int
 ) -> List[Dict[str, Any]]:
+    ligands = []
+
+    for b in geom_bonds:
+        a1 = clean_label(b["atom1"])
+        a2 = clean_label(b["atom2"])
+
+        if a1 == center_label:
+            lig_label = a2
+        elif a2 == center_label:
+            lig_label = a1
+        else:
+            continue
+
+        if lig_label not in site_dict:
+            continue
+
+        lig_site = site_dict[lig_label]
+
+        if lig_site.element.name not in DONOR_ELEMENTS:
+            continue
+
+        if b["distance"] is None:
+            continue
+
+        ligands.append(
+            {
+                "label": lig_label,
+                "element": lig_site.element.name,
+                "distance": b["distance"],
+                "distance_esd": b["distance_esd"],
+                "distance_raw": b["distance_raw"],
+                "sym1": b["sym1"],
+                "sym2": b["sym2"],
+                "publ_flag": b["publ_flag"],
+                "cart": get_cart_from_site(lig_site),
+                "source": "_geom_bond",
+            }
+        )
+
+    ligands.sort(key=lambda x: x["distance"])
 
     chosen = []
+    used = set()
 
-    used_labels = set()
-
-    for c in candidates:
-
-        if c["label"] in used_labels:
+    for lig in ligands:
+        if lig["label"] in used:
             continue
 
-        chosen.append(c)
-
-        used_labels.add(c["label"])
-
-        if len(chosen) == expected_cn:
-            return chosen
-
-    for c in candidates:
-
-        if c in chosen:
-            continue
-
-        chosen.append(c)
+        chosen.append(lig)
+        used.add(lig["label"])
 
         if len(chosen) == expected_cn:
             return chosen
@@ -245,244 +493,237 @@ def choose_ligands(
     return chosen
 
 
-# ------------------------------------------------
-# Angle calculation
-# ------------------------------------------------
+def get_cart_from_site(site: gemmi.SmallStructure.Site) -> gemmi.Position:
+    global CURRENT_CELL
+    return CURRENT_CELL.orthogonalize(site.fract)
 
-def compute_angles_from_ligands(
-    center_cart: gemmi.Position,
-    ligands: List[Dict[str, Any]]
-) -> Dict[str, Any]:
 
-    vecs = []
+def find_geom_angle(
+    geom_angles: List[Dict[str, Any]],
+    atom1: str,
+    center: str,
+    atom3: str
+) -> Optional[Dict[str, Any]]:
+    atom1 = clean_label(atom1)
+    center = clean_label(center)
+    atom3 = clean_label(atom3)
 
-    for lig in ligands:
+    for a in geom_angles:
+        a1 = clean_label(a["atom1"])
+        a2 = clean_label(a["atom2"])
+        a3 = clean_label(a["atom3"])
 
-        cart = lig["cart"]
+        if a2 != center:
+            continue
 
-        vecs.append(
-            (
-                cart.x - center_cart.x,
-                cart.y - center_cart.y,
-                cart.z - center_cart.z,
-            )
-        )
+        if (a1 == atom1 and a3 == atom3) or (a1 == atom3 and a3 == atom1):
+            return a
 
-    all_angles = []
-
-    for i in range(len(vecs)):
-
-        for j in range(i + 1, len(vecs)):
-
-            ang = angle_deg(
-                vecs[i],
-                vecs[j]
-            )
-
-            all_angles.append(
-                {
-                    "pair":
-                        f"{ligands[i]['label']} - "
-                        f"{ligands[j]['label']}",
-
-                    "angle": ang,
-
-                    "delta90":
-                        abs(90.0 - ang),
-                }
-            )
-
-    all_angles_sorted = sorted(
-        all_angles,
-        key=lambda x: x["delta90"]
-    )
-
-    cis_used = all_angles_sorted[:12]
-
-    trans_like = all_angles_sorted[12:]
-
-    sigma = sum(
-        x["delta90"]
-        for x in cis_used
-    )
-
-    sigma_values = [
-        x["delta90"]
-        for x in cis_used
-    ]
-
-    sigma_sd = calc_sd(
-        sigma_values
-    )
-
-    return {
-        "all_angles":
-            sorted(
-                all_angles,
-                key=lambda x: x["angle"]
-            ),
-
-        "cis_used":
-            sorted(
-                cis_used,
-                key=lambda x: x["angle"]
-            ),
-
-        "trans_like":
-            sorted(
-                trans_like,
-                key=lambda x: x["angle"]
-            ),
-
-        "sigma": sigma,
-
-        "sigma_sd": sigma_sd,
-    }
+    return None
 
 
 # ------------------------------------------------
-# Analyze center
+# Main center analysis
 # ------------------------------------------------
 
 def analyze_center(
     small: gemmi.SmallStructure,
     center_site: gemmi.SmallStructure.Site,
+    geom_bonds: List[Dict[str, Any]],
+    geom_angles: List[Dict[str, Any]],
     radius: float,
     expected_cn: int,
-) -> Dict[str, Any] | None:
+) -> Optional[Dict[str, Any]]:
+    site_dict = get_site_dict(small)
 
-    center_cart = small.cell.orthogonalize(
-        center_site.fract
+    center_label = clean_label(center_site.label)
+    center_cart = get_cart(small, center_site)
+
+    ligands = choose_ligands_from_geom_bond(
+        center_label=center_label,
+        site_dict=site_dict,
+        geom_bonds=geom_bonds,
+        expected_cn=expected_cn
     )
 
-    candidates = build_neighbor_candidates(
-        small,
-        center_site,
-        radius
-    )
-
-    if len(candidates) < expected_cn:
-        return None
-
-    ligands = choose_ligands(
-        candidates,
-        expected_cn
-    )
+    if len(ligands) < expected_cn:
+        ligands = build_neighbor_candidates_by_coord(
+            small=small,
+            center_site=center_site,
+            radius=radius
+        )[:expected_cn]
 
     if len(ligands) < expected_cn:
         return None
 
-    angle_info = compute_angles_from_ligands(
-        center_cart,
-        ligands
-    )
-
-    bond_lengths = [
+    bond_values = [
         lig["distance"]
+        for lig in ligands
+        if lig["distance"] is not None
+    ]
+
+    bond_esds = [
+        lig.get("distance_esd")
         for lig in ligands
     ]
 
-    mean_bond_length = (
-        sum(bond_lengths)
-        / len(bond_lengths)
+    mean_bond_length = calc_mean(bond_values)
+    mean_bond_esd = propagate_mean_esd(
+        bond_esds,
+        len(ligands)
     )
 
-    bond_length_sd = calc_sd(
-        bond_lengths
+    all_angles = []
+
+    for i in range(len(ligands)):
+        for j in range(i + 1, len(ligands)):
+            lig1 = ligands[i]
+            lig2 = ligands[j]
+
+            found = find_geom_angle(
+                geom_angles,
+                lig1["label"],
+                center_label,
+                lig2["label"]
+            )
+
+            if found is not None and found["angle"] is not None:
+                angle_value = found["angle"]
+                angle_esd = found["angle_esd"]
+                angle_raw = found["angle_raw"]
+                source = "_geom_angle"
+            else:
+                cart1 = lig1["cart"]
+                cart2 = lig2["cart"]
+
+                v1 = (
+                    cart1.x - center_cart.x,
+                    cart1.y - center_cart.y,
+                    cart1.z - center_cart.z,
+                )
+
+                v2 = (
+                    cart2.x - center_cart.x,
+                    cart2.y - center_cart.y,
+                    cart2.z - center_cart.z,
+                )
+
+                angle_value = angle_deg(v1, v2)
+                angle_esd = None
+                angle_raw = f"{angle_value:.3f}"
+                source = "calculated from coordinates"
+
+            delta90 = abs(90.0 - angle_value)
+
+            all_angles.append(
+                {
+                    "pair": f"{lig1['label']} - {lig2['label']}",
+                    "angle": angle_value,
+                    "angle_esd": angle_esd,
+                    "angle_raw": angle_raw,
+                    "delta90": delta90,
+                    "source": source,
+                }
+            )
+
+    sorted_for_sigma = sorted(
+        all_angles,
+        key=lambda x: x["delta90"]
+    )
+
+    cis_used = sorted_for_sigma[:12]
+    trans_like = sorted_for_sigma[12:]
+
+    sigma_value = sum(
+        x["delta90"]
+        for x in cis_used
+    )
+
+    sigma_esd = propagate_sum_esd(
+        [x["angle_esd"] for x in cis_used],
+        len(cis_used)
     )
 
     return {
+        "metal_label": center_label,
+        "metal_element": center_site.element.name,
 
-        "metal_label":
-            center_site.label,
+        "mean_bond_length": mean_bond_length,
+        "mean_bond_esd": mean_bond_esd,
 
-        "metal_element":
-            center_site.element.name,
-
-        "mean_bond_length":
-            round(mean_bond_length, 4),
-
-        "bond_length_sd":
-            round(bond_length_sd, 4),
-
-        "sigma":
-            round(
-                angle_info["sigma"],
-                3
-            ),
-
-        "sigma_sd":
-            round(
-                angle_info["sigma_sd"],
-                3
-            ),
+        "sigma": sigma_value,
+        "sigma_esd": sigma_esd,
 
         "ligands": [
             {
-                "label":
-                    lig["label"],
-
-                "element":
-                    lig["element"],
-
-                "distance":
-                    round(
-                        lig["distance"],
-                        4
-                    ),
-
-                "image_idx":
-                    lig["image_idx"],
-
-                "fract_x":
-                    round(
-                        lig["fract"].x,
-                        5
-                    ),
-
-                "fract_y":
-                    round(
-                        lig["fract"].y,
-                        5
-                    ),
-
-                "fract_z":
-                    round(
-                        lig["fract"].z,
-                        5
-                    ),
+                "label": lig["label"],
+                "element": lig["element"],
+                "distance": format_with_esd(
+                    lig["distance"],
+                    lig.get("distance_esd"),
+                    3
+                ),
+                "distance_value_A": round(lig["distance"], 5)
+                    if lig["distance"] is not None else None,
+                "distance_esd_A": round(lig["distance_esd"], 5)
+                    if lig.get("distance_esd") is not None else None,
+                "source": lig.get("source", ""),
+                "sym1": lig.get("sym1", ""),
+                "sym2": lig.get("sym2", ""),
+                "publ_flag": lig.get("publ_flag", ""),
             }
             for lig in ligands
         ],
 
         "cis_angles_used": [
-            round(x["angle"], 3)
-            for x in angle_info["cis_used"]
+            {
+                "pair": x["pair"],
+                "angle": format_with_esd(
+                    x["angle"],
+                    x["angle_esd"],
+                    1
+                ),
+                "angle_value_deg": round(x["angle"], 4),
+                "angle_esd_deg": round(x["angle_esd"], 4)
+                    if x["angle_esd"] is not None else None,
+                "delta90": round(x["delta90"], 4),
+                "source": x["source"],
+            }
+            for x in sorted(cis_used, key=lambda y: y["angle"])
         ],
 
         "trans_like_angles": [
-            round(x["angle"], 3)
-            for x in angle_info["trans_like"]
+            {
+                "pair": x["pair"],
+                "angle": format_with_esd(
+                    x["angle"],
+                    x["angle_esd"],
+                    1
+                ),
+                "angle_value_deg": round(x["angle"], 4),
+                "angle_esd_deg": round(x["angle_esd"], 4)
+                    if x["angle_esd"] is not None else None,
+                "delta90": round(x["delta90"], 4),
+                "source": x["source"],
+            }
+            for x in sorted(trans_like, key=lambda y: y["angle"])
         ],
 
         "all_angles": [
             {
-                "pair":
-                    x["pair"],
-
-                "angle":
-                    round(
-                        x["angle"],
-                        3
-                    ),
-
-                "delta90":
-                    round(
-                        x["delta90"],
-                        3
-                    ),
+                "pair": x["pair"],
+                "angle": format_with_esd(
+                    x["angle"],
+                    x["angle_esd"],
+                    1
+                ),
+                "angle_value_deg": round(x["angle"], 4),
+                "angle_esd_deg": round(x["angle_esd"], 4)
+                    if x["angle_esd"] is not None else None,
+                "delta90": round(x["delta90"], 4),
+                "source": x["source"],
             }
-            for x in angle_info["all_angles"]
+            for x in sorted(all_angles, key=lambda y: y["angle"])
         ],
     }
 
@@ -491,27 +732,30 @@ def analyze_center(
 # CIF analysis
 # ------------------------------------------------
 
+CURRENT_CELL = None
+
+
 def analyze_cif(
     file_bytes: bytes,
     max_centers: int,
     radius: float,
     expected_cn: int
 ) -> List[Dict[str, Any]]:
+    global CURRENT_CELL
 
     text = file_bytes.decode(
         "utf-8",
         errors="ignore"
     )
 
-    doc = gemmi.cif.read_string(
-        text
-    )
+    geom_bonds = extract_geom_bonds(text)
+    geom_angles = extract_geom_angles(text)
 
+    doc = gemmi.cif.read_string(text)
     block = doc.sole_block()
+    small = gemmi.make_small_structure_from_block(block)
 
-    small = gemmi.make_small_structure_from_block(
-        block
-    )
+    CURRENT_CELL = small.cell
 
     centers = find_metal_sites(
         small,
@@ -521,10 +765,11 @@ def analyze_cif(
     results = []
 
     for center_site in centers:
-
         res = analyze_center(
             small=small,
             center_site=center_site,
+            geom_bonds=geom_bonds,
+            geom_angles=geom_angles,
             radius=radius,
             expected_cn=expected_cn,
         )
@@ -544,13 +789,12 @@ st.title(
 )
 
 st.caption(
-    "CIF をアップロードすると、"
-    "八面体金属中心について "
-    "Σ 値と平均配位結合長を計算します。"
+    "CIF の _geom_bond / _geom_angle に記録された "
+    "2.186(19) 型の値を読み取り、"
+    "平均配位結合長と Σ 値を ESD 付きで計算します。"
 )
 
 with st.sidebar:
-
     st.header("設定")
 
     max_centers = st.number_input(
@@ -577,15 +821,21 @@ with st.sidebar:
         step=1
     )
 
+    st.markdown(
+        "**対象金属**: Fe, Co, Mn, Ni, Cu, Zn, Cr, V, Ru, Rh, Pd, Pt"
+    )
+
+    st.markdown(
+        "**対象 donor**: N, O, S, Cl, Br, F"
+    )
+
 uploaded = st.file_uploader(
     "CIF ファイルを選択",
     type=["cif"]
 )
 
 if uploaded is not None:
-
     try:
-
         results = analyze_cif(
             uploaded.read(),
             int(max_centers),
@@ -594,25 +844,19 @@ if uploaded is not None:
         )
 
         if not results:
-
             st.warning(
-                "解析できる金属中心が"
-                "見つかりませんでした。"
+                "解析できる金属中心が見つかりませんでした。"
+                "近傍探索半径や配位数を見直してください。"
             )
 
         else:
-
             st.subheader("計算結果")
 
             summary_rows = []
 
             for i, res in enumerate(results, start=1):
-
                 ligand_text = ", ".join(
-                    [
-                        x["label"]
-                        for x in res["ligands"]
-                    ]
+                    [x["label"] for x in res["ligands"]]
                 )
 
                 summary_rows.append(
@@ -626,14 +870,14 @@ if uploaded is not None:
                         "Σ":
                             format_with_esd(
                                 res["sigma"],
-                                res["sigma_sd"],
+                                res["sigma_esd"],
                                 1
                             ),
 
                         "Mean bond length (Å)":
                             format_with_esd(
                                 res["mean_bond_length"],
-                                res["bond_length_sd"],
+                                res["mean_bond_esd"],
                                 3
                             ),
 
@@ -642,29 +886,22 @@ if uploaded is not None:
                     }
                 )
 
-            summary_df = pd.DataFrame(
-                summary_rows
-            )
+            summary_df = pd.DataFrame(summary_rows)
 
             st.dataframe(
                 summary_df,
                 use_container_width=True
             )
 
-            st.markdown(
-                "### 見やすい要約"
-            )
+            st.markdown("### 見やすい要約")
 
             for i, res in enumerate(results, start=1):
-
                 with st.container(border=True):
-
                     c1, c2, c3 = st.columns(
                         [1.5, 1, 1]
                     )
 
                     with c1:
-
                         st.markdown(
                             f"**Center {i}: "
                             f"{res['metal_label']} "
@@ -674,31 +911,26 @@ if uploaded is not None:
                         st.write(
                             "採用配位原子:",
                             ", ".join(
-                                [
-                                    x["label"]
-                                    for x in res["ligands"]
-                                ]
+                                [x["label"] for x in res["ligands"]]
                             )
                         )
 
                     with c2:
-
                         st.metric(
                             "Σ",
                             format_with_esd(
                                 res["sigma"],
-                                res["sigma_sd"],
+                                res["sigma_esd"],
                                 1
                             )
                         )
 
                     with c3:
-
                         st.metric(
                             "平均結合長 (Å)",
                             format_with_esd(
                                 res["mean_bond_length"],
-                                res["bond_length_sd"],
+                                res["mean_bond_esd"],
                                 3
                             )
                         )
@@ -706,89 +938,76 @@ if uploaded is not None:
             st.markdown("### 詳細")
 
             for i, res in enumerate(results, start=1):
-
                 with st.expander(
                     f"Center {i}: "
                     f"{res['metal_label']} "
                     f"({res['metal_element']}) の詳細",
                     expanded=False
                 ):
-
-                    st.markdown(
-                        "#### 採用した配位原子像"
-                    )
+                    st.markdown("#### 採用した配位結合")
 
                     st.dataframe(
-                        pd.DataFrame(
-                            res["ligands"]
-                        ),
+                        pd.DataFrame(res["ligands"]),
                         use_container_width=True
                     )
 
                     col1, col2 = st.columns(2)
 
                     with col1:
+                        st.markdown("#### Σ に使用した 12 角")
 
-                        st.markdown(
-                            "#### Σ に使用した 12 角"
-                        )
-
-                        st.write(
-                            ", ".join(
-                                f"{x:.3f}"
-                                for x in res["cis_angles_used"]
-                            )
+                        st.dataframe(
+                            pd.DataFrame(res["cis_angles_used"]),
+                            use_container_width=True
                         )
 
                     with col2:
+                        st.markdown("#### 残り 3 角")
 
-                        st.markdown(
-                            "#### 残り 3 角"
+                        st.dataframe(
+                            pd.DataFrame(res["trans_like_angles"]),
+                            use_container_width=True
                         )
 
-                        st.write(
-                            ", ".join(
-                                f"{x:.3f}"
-                                for x in res["trans_like_angles"]
-                            )
-                        )
-
-                    st.markdown(
-                        "#### 全 15 角"
-                    )
+                    st.markdown("#### 全 15 角")
 
                     st.dataframe(
-                        pd.DataFrame(
-                            res["all_angles"]
-                        ),
+                        pd.DataFrame(res["all_angles"]),
                         use_container_width=True
                     )
 
             csv_rows = []
 
             for i, res in enumerate(results, start=1):
-
                 csv_rows.append(
                     {
                         "center": i,
+                        "metal_label": res["metal_label"],
+                        "metal_element": res["metal_element"],
 
-                        "metal_label":
-                            res["metal_label"],
-
-                        "metal_element":
-                            res["metal_element"],
-
-                        "sigma":
+                        "sigma": res["sigma"],
+                        "sigma_esd": res["sigma_esd"],
+                        "sigma_formatted": format_with_esd(
                             res["sigma"],
+                            res["sigma_esd"],
+                            1
+                        ),
 
-                        "sigma_sd":
-                            res["sigma_sd"],
-
-                        "mean_bond_length_A":
+                        "mean_bond_length_A": res["mean_bond_length"],
+                        "mean_bond_length_esd_A": res["mean_bond_esd"],
+                        "mean_bond_length_formatted": format_with_esd(
                             res["mean_bond_length"],
+                            res["mean_bond_esd"],
+                            3
+                        ),
 
-                        "bond_length_sd_A":
-                            res["bond_length_sd"],
+                        "ligands": "; ".join(
+                            [x["label"] for x in res["ligands"]]
+                        ),
+
+                        "bond_lengths": "; ".join(
+                            [x["distance"] for x in res["ligands"]]
+                        ),
                     }
                 )
 
@@ -806,13 +1025,11 @@ if uploaded is not None:
             )
 
     except Exception as e:
-
         st.error(
             f"解析に失敗しました: {e}"
         )
 
 else:
-
     st.info(
         "CIF ファイルをアップロードしてください。"
     )
@@ -820,6 +1037,15 @@ else:
 st.markdown("---")
 
 st.markdown(
-    "Copyright © 2026 "
-    "Yu ODASHIMA All Rights Reserved."
+    "平均配位結合長の ESD は、CIF 中の各 _geom_bond_distance の ESD から "
+    "sqrt(esd1^2 + esd2^2 + ... + esdn^2) / n として伝播しています。"
+)
+
+st.markdown(
+    "Σ の ESD は、Σ に使用した 12 個の _geom_angle の ESD から "
+    "sqrt(esd1^2 + esd2^2 + ... + esd12^2) として伝播しています。"
+)
+
+st.markdown(
+    "Copyright © 2026 Yu ODASHIMA All Rights Reserved."
 )
