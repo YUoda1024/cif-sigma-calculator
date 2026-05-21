@@ -4,34 +4,46 @@ from typing import List, Dict, Any, Tuple
 import gemmi
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Σ Value, Coord. bond length Calculator", layout="wide")
 
 METAL_ELEMENTS = {
     "Fe", "Co", "Mn", "Ni", "Cu", "Zn", "Cr", "V", "Ru", "Rh", "Pd", "Pt"
 }
+
 DONOR_ELEMENTS = {"N", "O", "S", "Cl", "Br", "F"}
+
 DEFAULT_MAX_CENTERS = 2
 DEFAULT_RADIUS = 2.5
 DEFAULT_EXPECTED_CN = 6
 
 
 def angle_deg(v1: Tuple[float, float, float], v2: Tuple[float, float, float]) -> float:
+
     dot = sum(x * y for x, y in zip(v1, v2))
+
     n1 = math.sqrt(sum(x * x for x in v1))
     n2 = math.sqrt(sum(x * x for x in v2))
+
     if n1 == 0 or n2 == 0:
         return float("nan")
+
     c = max(-1.0, min(1.0, dot / (n1 * n2)))
+
     return math.degrees(math.acos(c))
 
 
-def find_metal_sites(small: gemmi.SmallStructure, max_centers: int) -> List[gemmi.SmallStructure.Site]:
+def find_metal_sites(
+    small: gemmi.SmallStructure,
+    max_centers: int
+) -> List[gemmi.SmallStructure.Site]:
+
     centers = []
+
     for site in small.sites:
         if site.element.name in METAL_ELEMENTS:
             centers.append(site)
+
     return centers[:max_centers]
 
 
@@ -42,35 +54,56 @@ def build_neighbor_candidates(
 ) -> List[Dict[str, Any]]:
 
     ns = gemmi.NeighborSearch(small, radius).populate()
+
     center_frac = center_site.fract
     center_cart = small.cell.orthogonalize(center_frac)
 
     candidates: List[Dict[str, Any]] = []
     seen = set()
 
-    marks = ns.find_site_neighbors(center_site, min_dist=0.1, max_dist=radius)
+    marks = ns.find_site_neighbors(
+        center_site,
+        min_dist=0.1,
+        max_dist=radius
+    )
 
     for mark in marks:
+
         site = mark.to_site(small)
 
         if site.label == center_site.label:
             continue
+
         if site.element.name not in DONOR_ELEMENTS:
             continue
 
         fpos = small.cell.fractionalize(mark.pos)
 
-        images = small.cell.find_nearest_pbc_images(center_frac, radius, fpos, 0)
+        images = small.cell.find_nearest_pbc_images(
+            center_frac,
+            radius,
+            fpos,
+            0
+        )
+
         if not images:
-            images = [small.cell.find_nearest_pbc_image(center_cart, mark.pos, 0)]
+            images = [
+                small.cell.find_nearest_pbc_image(
+                    center_cart,
+                    mark.pos,
+                    0
+                )
+            ]
 
         for im in images:
+
             im_frac = small.cell.fract_image(im, fpos)
             im_cart = small.cell.orthogonalize(im_frac)
 
             dx = im_cart.x - center_cart.x
             dy = im_cart.y - center_cart.y
             dz = im_cart.z - center_cart.z
+
             dist = math.sqrt(dx * dx + dy * dy + dz * dz)
 
             key = (
@@ -80,8 +113,10 @@ def build_neighbor_candidates(
                 round(im_cart.y, 5),
                 round(im_cart.z, 5),
             )
+
             if key in seen:
                 continue
+
             seen.add(key)
 
             candidates.append(
@@ -96,26 +131,36 @@ def build_neighbor_candidates(
             )
 
     candidates.sort(key=lambda x: x["distance"])
+
     return candidates
 
 
-def choose_ligands(candidates: List[Dict[str, Any]], expected_cn: int) -> List[Dict[str, Any]]:
+def choose_ligands(
+    candidates: List[Dict[str, Any]],
+    expected_cn: int
+) -> List[Dict[str, Any]]:
 
     chosen = []
     used_labels = set()
 
     for c in candidates:
+
         if c["label"] in used_labels:
             continue
+
         chosen.append(c)
         used_labels.add(c["label"])
+
         if len(chosen) == expected_cn:
             return chosen
 
     for c in candidates:
+
         if c in chosen:
             continue
+
         chosen.append(c)
+
         if len(chosen) == expected_cn:
             return chosen
 
@@ -128,8 +173,11 @@ def compute_angles_from_ligands(
 ) -> Dict[str, Any]:
 
     vecs = []
+
     for lig in ligands:
+
         cart = lig["cart"]
+
         vecs.append(
             (
                 cart.x - center_cart.x,
@@ -139,9 +187,13 @@ def compute_angles_from_ligands(
         )
 
     all_angles = []
+
     for i in range(len(vecs)):
+
         for j in range(i + 1, len(vecs)):
+
             ang = angle_deg(vecs[i], vecs[j])
+
             all_angles.append(
                 {
                     "pair": f"{ligands[i]['label']} - {ligands[j]['label']}",
@@ -150,9 +202,14 @@ def compute_angles_from_ligands(
                 }
             )
 
-    all_angles_sorted_for_sigma = sorted(all_angles, key=lambda x: x["delta90"])
+    all_angles_sorted_for_sigma = sorted(
+        all_angles,
+        key=lambda x: x["delta90"]
+    )
+
     cis_used = all_angles_sorted_for_sigma[:12]
     trans_like = all_angles_sorted_for_sigma[12:]
+
     sigma = sum(x["delta90"] for x in cis_used)
 
     return {
@@ -171,31 +228,49 @@ def analyze_center(
 ) -> Dict[str, Any] | None:
 
     center_cart = small.cell.orthogonalize(center_site.fract)
-    candidates = build_neighbor_candidates(small, center_site, radius)
+
+    candidates = build_neighbor_candidates(
+        small,
+        center_site,
+        radius
+    )
 
     if len(candidates) < expected_cn:
         return None
 
     ligands = choose_ligands(candidates, expected_cn)
+
     if len(ligands) < expected_cn:
         return None
 
-    angle_info = compute_angles_from_ligands(center_cart, ligands)
+    angle_info = compute_angles_from_ligands(
+        center_cart,
+        ligands
+    )
 
     bond_lengths = [lig["distance"] for lig in ligands]
-    mean_bond_length = sum(bond_lengths) / len(bond_lengths)
+
+    mean_bond_length = (
+        sum(bond_lengths) / len(bond_lengths)
+    )
 
     if len(bond_lengths) > 1:
+
         bond_length_sd = math.sqrt(
-            sum((x - mean_bond_length) ** 2 for x in bond_lengths)
+            sum(
+                (x - mean_bond_length) ** 2
+                for x in bond_lengths
+            )
             / (len(bond_lengths) - 1)
         )
+
     else:
         bond_length_sd = 0.0
 
     return {
         "metal_label": center_site.label,
         "metal_element": center_site.element.name,
+
         "mean_bond_length": round(mean_bond_length, 4),
         "bond_length_sd": round(bond_length_sd, 4),
 
@@ -242,16 +317,26 @@ def analyze_cif(
     expected_cn: int
 ) -> List[Dict[str, Any]]:
 
-    text = file_bytes.decode("utf-8", errors="ignore")
+    text = file_bytes.decode(
+        "utf-8",
+        errors="ignore"
+    )
+
     doc = gemmi.cif.read_string(text)
+
     block = doc.sole_block()
+
     small = gemmi.make_small_structure_from_block(block)
 
-    centers = find_metal_sites(small, max_centers)
+    centers = find_metal_sites(
+        small,
+        max_centers
+    )
 
     results = []
 
     for center_site in centers:
+
         res = analyze_center(
             small=small,
             center_site=center_site,
@@ -270,7 +355,8 @@ def analyze_cif(
 st.title("Σ Value and Coord. bond length Calculator")
 
 st.caption(
-    "CIF をアップロードすると、八面体金属中心について "
+    "CIF をアップロードすると、"
+    "八面体金属中心について "
     "Σ 値と平均配位結合長を計算します。"
 )
 
@@ -304,7 +390,8 @@ with st.sidebar:
 
     st.markdown(
         "**対象金属**: "
-        "Fe, Co, Mn, Ni, Cu, Zn, Cr, V, Ru, Rh, Pd, Pt"
+        "Fe, Co, Mn, Ni, Cu, Zn, Cr, V, "
+        "Ru, Rh, Pd, Pt"
     )
 
     st.markdown(
@@ -350,55 +437,28 @@ if uploaded is not None:
                 summary_rows.append(
                     {
                         "Center": i,
-                        "Metal": f"{res['metal_label']} ({res['metal_element']})",
-                        "Σ": res["sigma"],
-                        "Mean bond length (Å)": res["mean_bond_length"],
-                        "Bond length SD (Å)": res["bond_length_sd"],
+
+                        "Metal":
+                            f"{res['metal_label']} "
+                            f"({res['metal_element']})",
+
+                        "Σ":
+                            f"{res['sigma']:.3f}",
+
+                        "Mean bond length (Å)":
+                            f"{res['mean_bond_length']:.4f} "
+                            f"({res['bond_length_sd']:.4f})",
+
                         "Ligands": ligand_text,
                     }
                 )
 
             summary_df = pd.DataFrame(summary_rows)
 
-            st.dataframe(summary_df, use_container_width=True)
-
-            # ---------------- Error Bar Graph ----------------
-
-            st.markdown("### 平均配位結合長のエラーバー表示")
-
-            fig, ax = plt.subplots(figsize=(6, 4))
-
-            x_labels = [
-                f"{res['metal_label']}"
-                for res in results
-            ]
-
-            means = [
-                res["mean_bond_length"]
-                for res in results
-            ]
-
-            errors = [
-                res["bond_length_sd"]
-                for res in results
-            ]
-
-            ax.bar(
-                x_labels,
-                means,
-                yerr=errors,
-                capsize=6
+            st.dataframe(
+                summary_df,
+                use_container_width=True
             )
-
-            ax.set_ylabel("Mean bond length / Å")
-            ax.set_xlabel("Metal center")
-            ax.set_title(
-                "Mean coordination bond length with SD error bars"
-            )
-
-            st.pyplot(fig)
-
-            # ---------------- Summary ----------------
 
             st.markdown("### 見やすい要約")
 
@@ -406,9 +466,12 @@ if uploaded is not None:
 
                 with st.container(border=True):
 
-                    c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1])
+                    c1, c2, c3 = st.columns(
+                        [1.5, 1, 1]
+                    )
 
                     with c1:
+
                         st.markdown(
                             f"**Center {i}: "
                             f"{res['metal_label']} "
@@ -418,29 +481,26 @@ if uploaded is not None:
                         st.write(
                             "採用配位原子:",
                             ", ".join(
-                                [x["label"] for x in res["ligands"]]
+                                [x["label"]
+                                 for x in res["ligands"]]
                             )
                         )
 
                     with c2:
+
                         st.metric(
                             "Σ",
                             f"{res['sigma']:.3f}"
                         )
 
                     with c3:
+
                         st.metric(
                             "平均結合長 (Å)",
                             f"{res['mean_bond_length']:.4f}"
+                            f" "
+                            f"({res['bond_length_sd']:.4f})"
                         )
-
-                    with c4:
-                        st.metric(
-                            "SD (Å)",
-                            f"{res['bond_length_sd']:.4f}"
-                        )
-
-            # ---------------- Detail ----------------
 
             st.markdown("### 詳細")
 
@@ -453,7 +513,9 @@ if uploaded is not None:
                     expanded=False
                 ):
 
-                    st.markdown("#### 採用した配位原子像")
+                    st.markdown(
+                        "#### 採用した配位原子像"
+                    )
 
                     st.dataframe(
                         pd.DataFrame(res["ligands"]),
@@ -463,7 +525,10 @@ if uploaded is not None:
                     col1, col2 = st.columns(2)
 
                     with col1:
-                        st.markdown("#### Σ に使用した 12 角")
+
+                        st.markdown(
+                            "#### Σ に使用した 12 角"
+                        )
 
                         st.write(
                             ", ".join(
@@ -473,7 +538,10 @@ if uploaded is not None:
                         )
 
                     with col2:
-                        st.markdown("#### 残り 3 角")
+
+                        st.markdown(
+                            "#### 残り 3 角"
+                        )
 
                         st.write(
                             ", ".join(
@@ -489,8 +557,6 @@ if uploaded is not None:
                         use_container_width=True
                     )
 
-            # ---------------- CSV ----------------
-
             csv_rows = []
 
             for i, res in enumerate(results, start=1):
@@ -500,30 +566,48 @@ if uploaded is not None:
                         "center": i,
                         "metal_label": res["metal_label"],
                         "metal_element": res["metal_element"],
+
                         "sigma": res["sigma"],
-                        "mean_bond_length_A": res["mean_bond_length"],
-                        "bond_length_sd_A": res["bond_length_sd"],
 
-                        "ligands": "; ".join(
-                            [x["label"] for x in res["ligands"]]
-                        ),
+                        "mean_bond_length_A":
+                            res["mean_bond_length"],
 
-                        "distances_A": "; ".join(
-                            str(x["distance"])
-                            for x in res["ligands"]
-                        ),
+                        "bond_length_sd_A":
+                            res["bond_length_sd"],
 
-                        "cis_angles_used_deg": "; ".join(
-                            map(str, res["cis_angles_used"])
-                        ),
+                        "ligands":
+                            "; ".join(
+                                [x["label"]
+                                 for x in res["ligands"]]
+                            ),
 
-                        "trans_like_angles_deg": "; ".join(
-                            map(str, res["trans_like_angles"])
-                        ),
+                        "distances_A":
+                            "; ".join(
+                                str(x["distance"])
+                                for x in res["ligands"]
+                            ),
+
+                        "cis_angles_used_deg":
+                            "; ".join(
+                                map(
+                                    str,
+                                    res["cis_angles_used"]
+                                )
+                            ),
+
+                        "trans_like_angles_deg":
+                            "; ".join(
+                                map(
+                                    str,
+                                    res["trans_like_angles"]
+                                )
+                            ),
                     }
                 )
 
-            csv_data = pd.DataFrame(csv_rows).to_csv(
+            csv_data = pd.DataFrame(
+                csv_rows
+            ).to_csv(
                 index=False
             ).encode("utf-8-sig")
 
@@ -540,21 +624,28 @@ if uploaded is not None:
 
 else:
 
-    st.info("CIF ファイルをアップロードしてください。")
+    st.info(
+        "CIF ファイルをアップロードしてください。"
+    )
 
 st.markdown("---")
 
 st.markdown(
-    "このアプリでは、採用した配位原子から "
+    "このアプリでは、採用した "
+    "6 配位原子から "
     "15 個の角を計算し、"
-    "90° に最も近い 12 個を用いて Σ を求めています。"
+    "90° に最も近い "
+    "12 個を用いて "
+    "Σ を求めています。"
 )
 
 st.markdown(
-    "平均配位結合長のエラーバーには "
-    "6 本の配位結合長の標準偏差 (SD) を使用しています。"
+    "平均配位結合長の括弧内には "
+    "6 本の配位結合長の "
+    "標準偏差 (SD) を表示しています。"
 )
 
 st.markdown(
-    "Copyright © 2026 Yu ODASHIMA All Rights Reserved."
+    "Copyright © 2026 "
+    "Yu ODASHIMA All Rights Reserved."
 )
